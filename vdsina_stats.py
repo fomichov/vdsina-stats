@@ -43,14 +43,9 @@ class VdsinaClient:
     def get_server(self, server_id: int | str) -> dict:
         return self._get(f"/server/{server_id}")["data"]
 
-    def get_server_stat_7d(self, server_id: int | str) -> list[dict]:
-        # API ignores date_from/date_to — always returns ~30 days; filter manually.
-        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-        all_stat = self._get(f"/server.stat/{server_id}")["data"]
-        return [
-            s for s in all_stat
-            if datetime.fromisoformat(s["dt"]) >= cutoff.replace(tzinfo=None)
-        ]
+    def get_server_stat(self, server_id: int | str) -> list[dict]:
+        # API ignores date_from/date_to — always returns ~30 days.
+        return self._get(f"/server.stat/{server_id}")["data"]
 
 
 def bytes_to_gb(value: int | None) -> int | None:
@@ -69,8 +64,10 @@ def load_secrets(path: Path) -> list[dict]:
     return raw
 
 
-def collect_stats(client: VdsinaClient, account_server: str, account_user: str) -> list[dict]:  # noqa: E501
+def collect_stats(client: VdsinaClient, account_server: str, account_user: str, skip_ids: set[int] | None = None) -> list[dict]:  # noqa: E501
     servers = client.list_servers()
+    if skip_ids:
+        servers = [s for s in servers if s["id"] not in skip_ids]
     print(f"  Found {len(servers)} server(s).")
 
     rows = []
@@ -85,10 +82,18 @@ def collect_stats(client: VdsinaClient, account_server: str, account_user: str) 
         traff_data = (detail.get("data") or {}).get("traff") or {}
         plan_traff_bytes = traff_data.get("bytes")
 
-        stat_7d = client.get_server_stat_7d(server_id)
+        all_stat = client.get_server_stat(server_id)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        cutoff_7d = now - timedelta(days=7)
+        cutoff_1d = now - timedelta(days=1)
+        stat_7d = [s for s in all_stat if datetime.fromisoformat(s["dt"]) >= cutoff_7d]
+        stat_1d = [s for s in all_stat if datetime.fromisoformat(s["dt"]) >= cutoff_1d]
         last_7d_bytes = sum(
             s["stat"]["vnet_rx"] + s["stat"]["vnet_tx"] for s in stat_7d
         ) if stat_7d else None
+        last_1d_bytes = sum(
+            s["stat"]["vnet_rx"] + s["stat"]["vnet_tx"] for s in stat_1d
+        ) if stat_1d else None
 
         row = {
             "account_server": account_server,
@@ -103,13 +108,16 @@ def collect_stats(client: VdsinaClient, account_server: str, account_user: str) 
             "last_month_gb": bytes_to_gb(last_bytes),
             "last_7d_bytes": last_7d_bytes,
             "last_7d_gb": bytes_to_gb(last_7d_bytes),
+            "last_1d_bytes": last_1d_bytes,
+            "last_1d_gb": bytes_to_gb(last_1d_bytes),
         }
         print(
             f"    [{server_id}] {row['server_name']}: "
             f"plan={row['plan_traff_gb']} GB, "
             f"current={row['current_month_gb']} GB, "
             f"last={row['last_month_gb']} GB, "
-            f"7d={row['last_7d_gb']} GB"
+            f"7d={row['last_7d_gb']} GB, "
+            f"1d={row['last_1d_gb']} GB"
         )
         rows.append(row)
 
@@ -122,7 +130,7 @@ def export_json(rows: list[dict], path: Path) -> None:
         "servers": rows,
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"JSON written → {path}")
+    print(f"JSON written → {path.relative_to(Path.cwd())}")
 
 
 def export_csv(rows: list[dict], path: Path) -> None:
@@ -139,12 +147,14 @@ def export_csv(rows: list[dict], path: Path) -> None:
         "last_month_gb",
         "last_7d_bytes",
         "last_7d_gb",
+        "last_1d_bytes",
+        "last_1d_gb",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"CSV written  → {path}")
+    print(f"CSV written  → {path.relative_to(Path.cwd())}")
 
 
 def main() -> None:
@@ -155,6 +165,14 @@ def main() -> None:
         help="Only collect stats for accounts matching this user (from secrets.yml).",
     )
     args = parser.parse_args()
+
+    skip_ids_path = Path(__file__).parent / "skip_ids.yml"
+    skip_ids: set[int] = set()
+    if skip_ids_path.exists():
+        raw_skip = yaml.safe_load(skip_ids_path.read_text(encoding="utf-8")) or {}
+        skip_ids = set(raw_skip.get("skip_ids", []))
+        if skip_ids:
+            print(f"Skipping server IDs: {sorted(skip_ids)}")
 
     secrets_path = Path(__file__).parent / "secrets.yml"
     if not secrets_path.exists():
@@ -189,7 +207,7 @@ def main() -> None:
         client = VdsinaClient(api_key, base_url)
 
         try:
-            rows = collect_stats(client, server, user)
+            rows = collect_stats(client, server, user, skip_ids)
             all_rows.extend(rows)
         except requests.HTTPError as exc:
             print(f"  HTTP error: {exc}", file=sys.stderr)
